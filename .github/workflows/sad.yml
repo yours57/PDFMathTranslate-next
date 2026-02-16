@@ -1,0 +1,253 @@
+name: Sync and Deploy
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "0 0 * * *" # daily at midnight
+  workflow_dispatch:
+
+jobs:
+  sync:
+    name: Sync latest commits from upstream repo
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork }}
+    outputs:
+      changes: ${{ steps.check_changes.outputs.changes }}
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v3
+      - name: Sync upstream changes
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          upstream_sync_repo: PDFMathTranslate-next/PDFMathTranslate-next
+          upstream_sync_branch: main
+          target_sync_branch: main
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          test_mode: false
+      - name: Check if there were changes
+        id: check_changes
+        run: |
+          if [[ ${{ steps.sync.outputs.has_new_commits }} == "true" ]]; then
+            echo "changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "changes=false" >> $GITHUB_OUTPUT
+          fi
+
+  deploy:
+    needs: sync
+    if: |
+      always() &&
+      (needs.sync.result == 'success' || needs.sync.result == 'skipped') &&
+      (github.event_name == 'push' || (github.event_name == 'schedule' && needs.sync.outputs.changes == 'true') || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Check for HF_TOKEN
+        id: check_token
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [[ -n "$HF_TOKEN" ]]; then
+            echo "token_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "token_exists=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Deploy to HuggingFace Spaces
+        if: steps.check_token.outputs.token_exists == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_USERNAME: ${{ secrets.HF_USERNAME }}
+          HF_SPACE_NAME: ${{ secrets.HF_SPACE_NAME }}
+        run: |
+          rm -rf .git
+          rm -f README.md Dockerfile
+
+          cat <<EOF > Dockerfile
+          FROM python:3.12
+          RUN useradd -m -u 1000 appuser
+          WORKDIR /app
+          COPY . .
+          RUN chown -R appuser:appuser /app
+          RUN apt-get update && apt-get install -y libgl1 inotify-tools
+          ENV HF_HOME="/app/hf_cache"
+          RUN pip install .
+          COPY entrypoint.sh /app/entrypoint.sh
+          RUN chmod +x /app/entrypoint.sh
+          USER appuser
+          EXPOSE 7860
+          ENV PYTHONUNBUFFERED=1
+          ENTRYPOINT ["/app/entrypoint.sh"]
+          EOF
+
+          cat <<EOF > README.md
+          ---
+          title: pmtn
+          sdk: docker
+          app_port: 7860
+          pinned: false
+          license: agpl-3.0
+          short_description: 'Demo'
+          ---
+          Check out the configuration reference at https://huggingface.co/docs/hub/spaces-config-reference
+          EOF
+
+          cat <<'EOF' > entrypoint.sh
+          #!/bin/bash
+          set -eo pipefail
+
+          DEBUG="${DEBUG_MODE:-false}"
+          debug_log() { [ "$DEBUG" = "true" ] && echo "[DEBUG]$*" || true; }
+
+          WATCH_DIR="pdf2zh_files"
+
+          cleanup() {
+              debug_log " 正在退出..."
+              exit 0
+          }
+          trap cleanup SIGTERM SIGINT
+
+          # ── 可选：认证文件 ──
+          if [ -n "${APP_USERS:-}" ]; then
+            echo "$APP_USERS" > /app/auth.txt
+            chmod 600 /app/auth.txt
+            AUTH_ARGS="--auth-file /app/auth.txt"
+            echo "[INFO] 认证已启用"
+          else
+            AUTH_ARGS=""
+          fi
+
+          # ── 启动 GUI（后台）──
+          # 不需要配置文件，pdf2zh_next 直接读取 PDF2ZH_ 前缀的环境变量
+          # 在 HF Spaces Settings 中配置如下变量：
+          #
+          #   PDF2ZH_OPENAI_API_KEY       = sk-xxx
+          #   PDF2ZH_OPENAI_BASE_URL      = https://api.openai.com/v1
+          #   PDF2ZH_OPENAI_MODEL         = gpt-4o-mini
+          #   PDF2ZH_ENABLED_SERVICES     = SiliconFlowFree,Google,Bing,OpenAI
+          #   PDF2ZH_DISABLE_GUI_SENSITIVE_INPUT = true
+          #   PDF2ZH_DISABLE_CONFIG_AUTO_SAVE    = true
+          #   PDF2ZH_UI_LANG              = zh
+          #
+          # 如需 WebDAV，还需配置（Secret）：
+          #   WEBDAV_URL
+          #   WEBDAV_USER
+          #   WEBDAV_PASS
+          #
+          PDF2ZH_LOG="/app/pdf2zh.log"
+          if [ "$DEBUG" = "true" ]; then
+              pdf2zh_next --gui --debug $AUTH_ARGS 2>&1 | tee "$PDF2ZH_LOG" &
+          else
+              COLUMNS=999 TERM=dumb pdf2zh_next --gui $AUTH_ARGS 2>&1 | tee "$PDF2ZH_LOG" | grep --line-buffered -iE "WARNING|ERROR|CRITICAL" &
+          fi
+          GUI_PID=$!
+          echo "[INFO] pdf2zh_next 已启动 (PID: $GUI_PID)"
+
+          # ── 等待 GUI 启动并创建输出目录 ──
+          debug_log " 等待 $WATCH_DIR 目录创建..."
+          for i in $(seq 1 30); do
+              if [ -d "$WATCH_DIR" ]; then
+                  debug_log " $WATCH_DIR 目录已存在"
+                  break
+              fi
+              sleep 2
+          done
+          debug_log " 当前工作目录: $(pwd)"
+          debug_log " 顶层目录结构:"
+          [ "$DEBUG" = "true" ] && ls -la
+          debug_log " $WATCH_DIR 目录结构:"
+          [ "$DEBUG" = "true" ] && find "$WATCH_DIR" -type f 2>/dev/null || debug_log " $WATCH_DIR 目录为空或不存在"
+
+          # ── 后台定期打印目录变化 ──
+          if [ "$DEBUG" = "true" ]; then
+          (
+              while true; do
+                  sleep 60
+                  debug_log "[$(date)] $WATCH_DIR 目录内容:"
+                  find "$WATCH_DIR" -type f 2>/dev/null || echo "(空)"
+              done
+          ) &
+          fi
+
+          # ── WebDAV 自动上传逻辑（仅在配置了 WEBDAV_URL 时启用）──
+          if [ -z "${WEBDAV_URL:-}" ]; then
+              echo "[INFO] WebDAV 未配置，文件监控已跳过"
+              wait
+              exit 0
+          fi
+          echo "[INFO] WebDAV 已配置，启动文件监控"
+
+          if [ ! -d "$WATCH_DIR" ]; then
+              mkdir -p "$WATCH_DIR"
+          fi
+
+          upload_file() {
+              local filename="$1"
+              local filepath="$2"
+              debug_log "[upload] 调用 upload_file: filename=$filename, filepath=$filepath"
+              (
+                  flock -n 9 || exit 1
+                  local encoded_file
+                  encoded_file=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "$filename")
+                  # 检查远端是否已存在
+                  local http_code
+                  http_code=$(curl -s -o /dev/null -w "%{http_code}" --head "${WEBDAV_URL}/$encoded_file" --user "${WEBDAV_USER}:${WEBDAV_PASS}")
+                  if [ "$http_code" = "200" ]; then
+                      debug_log "[upload] 远端已存在 $filename，跳过"
+                      exit 0
+                  fi
+                  debug_log "[upload] 正在上传 $filename..."
+                  if curl -s -o /dev/null -w "%{http_code}" -T "$filepath" "${WEBDAV_URL}/$encoded_file" --user "${WEBDAV_USER}:${WEBDAV_PASS}" | grep -q "^2"; then
+                      echo "[INFO] 成功上传 $filename"
+                  else
+                      echo "[ERROR] 上传 $filename 失败" >&2
+                  fi
+              ) 9>/tmp/upload.lock
+          }
+
+          if command -v inotifywait >/dev/null 2>&1; then
+              debug_log " inotifywait 已安装，开始递归监控 $WATCH_DIR ..."
+              debug_log " 监控事件: create, moved_to, close_write | 递归: 是"
+              if [ "$DEBUG" = "true" ]; then
+                  INOTIFY_STDERR="/dev/stderr"
+              else
+                  INOTIFY_STDERR="/dev/null"
+              fi
+              inotifywait -m -r -e create -e moved_to -e close_write --format '%w%f' "$WATCH_DIR" 2>"$INOTIFY_STDERR" |
+              while read -r filepath; do
+                  debug_log "[inotify] 检测到文件事件: $filepath"
+                  if [[ "$filepath" =~ \.pdf$ ]] && [ -f "$filepath" ]; then
+                      filename=$(basename "$filepath")
+                      debug_log "[inotify] PDF 文件确认，准备上传: $filename ($filepath)"
+                      upload_file "$filename" "$filepath"
+                  else
+                      debug_log "[inotify] 跳过非 PDF 或不存在: $filepath"
+                  fi
+              done
+          else
+              debug_log " 未安装 inotifywait，使用定期检查方式。"
+              while true; do
+                  find "$WATCH_DIR" -name "*.pdf" -type f | while read -r filepath; do
+                      filename=$(basename "$filepath")
+                      upload_file "$filename" "$filepath"
+                  done
+                  sleep 60
+              done
+          fi
+          EOF
+
+          # Configure git
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+          git init --initial-branch=main
+          git lfs install
+          git lfs track "*.png"
+          git lfs track "*.pdf"
+          git lfs track "*.gif"
+          git add .
+          git commit -m "GitHub deploy: ${{ github.sha }}"
+          git push --force https://${HF_USERNAME}:${HF_TOKEN}@huggingface.co/spaces/${HF_USERNAME}/${HF_SPACE_NAME} main
